@@ -137,7 +137,7 @@ void TRG_exact_spinsystem(  double T, double &val )
     auto summ_points = 10000.0; 
     auto del_theta = std::abs(theta_initial - theta_final)/summ_points; 
 
-    for(int i=0; i<(int)summ_points; ++i)
+    for(int i=0; i<(int)summ_points + 1; ++i)
     {
         auto theta = theta_initial + ((double)i)*del_theta; 
 
