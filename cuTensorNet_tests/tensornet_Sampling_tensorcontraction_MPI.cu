@@ -12,6 +12,22 @@
 #include <cuda_runtime.h>
 #include <cutensornet.h>
 
+#include <mpi.h>
+
+#define HANDLE_MPI_ERROR(x)                                        \
+    do {                                                           \
+        const auto err = x;                                        \
+        if (err != MPI_SUCCESS)                                    \
+        {                                                          \
+            char error[MPI_MAX_ERROR_STRING];                      \
+            int len;                                               \
+            MPI_Error_string(err, error, &len);                    \
+            printf("MPI Error: %s in line %d\n", error, __LINE__); \
+            fflush(stdout);                                        \
+            MPI_Abort(MPI_COMM_WORLD, err);                        \
+        }                                                          \
+    } while (0)
+
 #define HANDLE_ERROR(x) \
     do {   \
             const auto err = x; \
@@ -69,19 +85,36 @@ private:
     cudaStream_t stream_; 
 };
 
-void MPS_sample()
+void tensorcontraction_sample(int argc, char* argv[])
 {
     static_assert(sizeof(size_t) == sizeof(int64_t), "Please build this sample on 64 bit arch");
+
+    // Initialize MPI
+    HANDLE_MPI_ERROR(MPI_Init(&argc, &argv));
+    int rank{-1};
+    HANDLE_MPI_ERROR(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+    int numProcs{0};
+    HANDLE_MPI_ERROR(MPI_Comm_size(MPI_COMM_WORLD, &numProcs));
 
     bool verbose = true; 
 
     const size_t cuTensornetVersion = cutensornetGetVersion(); 
     if (verbose) printf("cuTensorNet version: %ld\n", cuTensornetVersion); 
 
+    /*changed for MPI 
     int numDevices{0}; 
     HANDLE_CUDA_ERROR(cudaGetDeviceCount(&numDevices)); 
     const int deviceId = 0; 
     cudaDeviceProp prop; 
+    HANDLE_CUDA_ERROR(cudaGetDeviceProperties(&prop, deviceId));
+    */
+
+    // Set GPU device based on ranks and nodes
+    int numDevices{0};
+    HANDLE_CUDA_ERROR(cudaGetDeviceCount(&numDevices));
+    const int deviceId = rank % numDevices; // we assume that the processes are mapped to nodes in contiguous chunks
+    HANDLE_CUDA_ERROR(cudaSetDevice(deviceId));
+    cudaDeviceProp prop;
     HANDLE_CUDA_ERROR(cudaGetDeviceProperties(&prop, deviceId));
 
     if(verbose)
@@ -103,6 +136,7 @@ void MPS_sample()
     }
 
     typedef float floatType; 
+    MPI_Datatype floatTypeMPI = MPI_FLOAT; 
     cudaDataType_t typeData =   CUDA_R_32F; 
     cutensornetComputeType_t typeCompute = CUTENSORNET_COMPUTE_32F; 
 
@@ -189,7 +223,32 @@ void MPS_sample()
         }
     }
 
+    /* cancelled for MPI
     for(int32_t t = 0; t < numInputs + 1; ++t)
+    {
+        HANDLE_CUDA_ERROR(cudaMemcpy(tensorData_d[t], tensorData_h[t], tensorSizes[t], cudaMemcpyHostToDevice));
+    }*/
+
+
+    // init output tensor to all 0s
+    memset(tensorData_h[numInputs], 0, tensorSizes[numInputs]);
+    if (rank == 0)
+    {
+        // init input tensors to random values
+        for (int32_t t = 0; t < numInputs; ++t)
+        {
+            for (uint64_t i = 0; i < tensorElements[t]; ++i) tensorData_h[t][i] = ((floatType)rand()) / RAND_MAX;
+        }
+    }
+
+    // Broadcast input data to all ranks
+    for (int32_t t = 0; t < numInputs; ++t)
+    {
+        HANDLE_MPI_ERROR(MPI_Bcast(tensorData_h[t], tensorElements[t], floatTypeMPI, 0, MPI_COMM_WORLD));
+    }
+
+    // copy input data to device buffers
+    for (int32_t t = 0; t < numInputs; ++t)
     {
         HANDLE_CUDA_ERROR(cudaMemcpy(tensorData_d[t], tensorData_h[t], tensorSizes[t], cudaMemcpyHostToDevice));
     }
@@ -242,6 +301,16 @@ void MPS_sample()
     HANDLE_CUDA_ERROR(cudaMemGetInfo(&freeMem, &totalMem)); 
     uint64_t workspaceLimit = (uint64_t)((double)freeMem * 0.9); 
     if (verbose) printf("Workspace limit = %lu GB\n", workspaceLimit / 1024 / 1024 / 1024);
+
+    /*******************************
+     * Activate distributed (parallel) execution prior to
+     * calling contraction path finder and contraction executor
+     *******************************/
+    // HANDLE_ERROR( cutensornetDistributedResetConfiguration(handle, NULL, 0) ); // resets back to serial execution
+    MPI_Comm cutnComm;
+    HANDLE_MPI_ERROR(MPI_Comm_dup(MPI_COMM_WORLD, &cutnComm)); // duplicate MPI communicator
+    HANDLE_ERROR(cutensornetDistributedResetConfiguration(handle, &cutnComm, sizeof(cutnComm)));
+    if (verbose) printf("Reset distributed MPI configuration\n");
 
     cutensornetContractionOptimizerConfig_t optimizerConfig; 
     HANDLE_ERROR(cutensornetCreateContractionOptimizerConfig(handle, &optimizerConfig)); 
@@ -430,6 +499,9 @@ void MPS_sample()
     }
     if (work) cudaFree(work);
 
+    // Shut down MPI service
+    HANDLE_MPI_ERROR(MPI_Finalize());
+
     if (verbose) printf("Freed resources and exited\n");
 
 
@@ -437,7 +509,7 @@ void MPS_sample()
 
 int main(int argc, char* argv[])
 {
-    MPS_sample();
+    tensorcontraction_sample(argc, argv);
     
     return 0; 
 }
