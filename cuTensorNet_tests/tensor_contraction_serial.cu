@@ -349,4 +349,6 @@ int main()
                                                requiredWorkspaceSize));
 
     if (verbose) printf("Allocated and set up the GPU workspace\n");
+
+    
 }
